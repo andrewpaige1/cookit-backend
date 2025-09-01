@@ -182,31 +182,25 @@ async def transcribe_media_async(file_path: str, client) -> str:
         return "No speech detected in the file."
 # --- API Endpoint for Parsing Video Recipes ---
 
-# ✨ NEW: Replace your old TTS helper with this updated version
 
-async def text_to_speech_async(text: str, client: openai.OpenAI) -> AsyncGenerator[bytes, None]:
+async def text_to_speech_async(text: str, client: openai.OpenAI, voice: str = "nova") -> AsyncGenerator[bytes, None]:
     """
     Converts text to speech using OpenAI's latest streaming API and yields audio chunks.
+    Accepts a specific voice parameter.
     """
-    print(f"🔊 Generating audio for text: '{text[:50]}...'")
+    print(f"🔊 Generating audio for text: '{text[:50]}...' with voice: {voice}")
     try:
-        # Use the new, more descriptive model and add instructions
         with client.audio.speech.with_streaming_response.create(
             model="tts-1",
-            voice="coral", # A new, expressive voice
+            voice=voice, # ✨ Use the voice parameter here
             input=text,
             speed=0.95,
-            instructions="Speak in a friendly and helpful tone, as if you are a cooking assistant.",
         ) as response:
-            # Stream the audio chunks as they are received from the API
             for chunk in response.iter_bytes():
                 yield chunk
     except Exception as e:
         print(f"❌ Error in text_to_speech_async: {e}")
-        # In a real app, you might want to stream a pre-recorded error sound here
-        # For now, we'll just stop the stream. The client will receive an empty response.
         return
-
 # --- Unified Recipe Parsing Endpoint (video URL or audio file) ---
 @app.post("/parse-recipe")
 async def parse_recipe(
@@ -769,7 +763,9 @@ async def root():
 
 # MARK: - AI Assistant Endpoints
 
-# ✨ MODIFIED: Fully corrected /assistant/chat endpoint
+# In main.py
+
+# ✨ FINAL IMPLEMENTATION: /assistant/chat
 
 @app.post("/assistant/chat")
 async def chat_with_assistant(
@@ -777,78 +773,58 @@ async def chat_with_assistant(
     message: str = Form(None),
     conversation_history: Optional[str] = Form(None),
     audio: UploadFile = File(None),
-    # Add the optional query parameter to choose the response type
+    voice: Optional[str] = Form("nova"), # Accepts voice selection
     audio_response: bool = Query(False, description="Set to true to receive an MP3 audio response instead of JSON."),
+    preview: bool = Query(False, description="Set to true for voice preview (no recipe required)."),
     user_data: dict = Depends(verify_supabase_jwt),
     db: AsyncSession = Depends(get_async_session)
 ):
-    """
-    Chat with AI assistant about a specific recipe.
-    Returns JSON by default, or an MP3 audio stream if audio_response=true.
-    """
     try:
-        # If audio is provided, transcribe it to get the message text
+        # --- PREVIEW MODE: Return generic voice preview ---
+        if preview:
+            voice_name = (voice or "nova")
+            preview_text = f"Hello, my name is {str(voice_name).capitalize()}."
+            if audio_response:
+                audio_generator = text_to_speech_async(preview_text, client, voice=voice_name)
+                return StreamingResponse(audio_generator, media_type="audio/mpeg")
+            return {"success": True, "message": preview_text, "type": "preview"}
+        # Step 1: Transcribe audio to text if provided
         if audio is not None:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".m4a") as temp_audio:
                 temp_audio.write(await audio.read())
-                temp_audio.flush()
                 temp_audio_path = temp_audio.name
             message = await transcribe_media_async(temp_audio_path, client)
             os.remove(temp_audio_path)
-            if not message or message.strip() == "No speech detected in the file.":
-                # Handle case of no speech detected
-                error_response = { "success": False, "message": "No speech detected in the audio file." }
-                if audio_response:
-                    audio_generator = text_to_speech_async(error_response["message"], client)
-                    return StreamingResponse(audio_generator, media_type="audio/mpeg")
-                return error_response
 
-        if not message:
-            return {"success": False, "message": "No message provided."}
+        # Handle case of no speech or message
+        if not message or message.strip().lower() == "no speech detected in the file.":
+            json_response = { "success": False, "message": "No speech detected in the audio file." }
+            if audio_response:
+                audio_generator = text_to_speech_async(json_response["message"], client, voice=voice or "nova")
+                return StreamingResponse(audio_generator, media_type="audio/mpeg")
+            return json_response
 
-        # Parse conversation_history if present
-        history = []
-        if conversation_history:
-            try:
-                history = json.loads(conversation_history)
-            except Exception:
-                history = []
-        
-        # Get the text response from the assistant's core logic
+        # Step 2: Get the text response from the assistant's core logic
+        history = json.loads(conversation_history) if conversation_history else []
         response_data = await recipe_assistant.process_message(
-            message=message,
-            recipe_id=recipe_id,
-            user_id=user_data["user_id"],
-            db=db,
-            conversation_history=history
+            message=message, recipe_id=recipe_id, user_id=user_data["user_id"], db=db, conversation_history=history
         )
 
-        # At the end, decide whether to send the JSON or convert its text to audio
+        # Step 3: At the very end, decide the output format
         if audio_response:
             text_to_speak = response_data.get("response", "I'm not sure how to respond to that.")
-            audio_generator = text_to_speech_async(text_to_speak, client)
+            audio_generator = text_to_speech_async(text_to_speak, client, voice=voice or "nova")
             return StreamingResponse(audio_generator, media_type="audio/mpeg")
         else:
-            # Default behavior: return the detailed JSON object
             return {
-                "success": True,
-                "message": response_data["response"],
-                "type": response_data["type"],
-                "data": response_data.get("data"),
-                "intent": response_data.get("intent"),
-                "recipe_context": response_data.get("recipe_context"),
-                "timestamp": datetime.utcnow().isoformat()
+                "success": True, "message": response_data["response"], "type": response_data["type"],
+                "data": response_data.get("data"), "intent": response_data.get("intent"),
+                "recipe_context": response_data.get("recipe_context"), "timestamp": datetime.utcnow().isoformat()
             }
             
-    except HTTPException as e:
-        raise e
     except Exception as e:
         print(f"Assistant chat error: {e}")
-        # Always return a JSON error for the root exception handler
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Assistant unavailable: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Assistant unavailable: {str(e)}")
 
 @app.get("/assistant/quick-commands/{recipe_id}")
 async def get_quick_commands(
@@ -937,7 +913,6 @@ async def get_quick_commands(
             detail=f"Could not generate quick commands: {str(e)}"
         )
 
-# ✨ MODIFIED: Fully corrected /assistant/voice endpoint
 
 @app.post("/assistant/voice")
 async def process_voice_command(
@@ -945,80 +920,100 @@ async def process_voice_command(
     command: str = Form(None),
     current_step: Optional[int] = Form(None),
     audio: UploadFile = File(None),
+    voice: Optional[str] = Form("nova"), # Accepts voice selection
     audio_response: bool = Query(False, description="Set to true to receive an MP3 audio response instead of JSON."),
+    preview: bool = Query(False, description="Set to true for voice preview (no recipe required)."),
     user_data: dict = Depends(verify_supabase_jwt),
     db: AsyncSession = Depends(get_async_session)
 ):
     try:
+        # --- PREVIEW MODE: Return generic voice preview ---
+        if preview:
+            voice_name = (voice or "nova")
+            preview_text = f"Hello, my name is {str(voice_name).capitalize()}."
+            if audio_response:
+                audio_generator = text_to_speech_async(preview_text, client, voice=voice_name)
+                return StreamingResponse(audio_generator, media_type="audio/mpeg")
+            return {"type": "preview", "response": preview_text}
+        # Step 1: Transcribe audio to text if provided
         if audio is not None:
-            # ... (your audio transcription logic)
             with tempfile.NamedTemporaryFile(delete=False, suffix=".m4a") as temp_audio:
                 temp_audio.write(await audio.read())
-                temp_audio.flush()
                 temp_audio_path = temp_audio.name
             command = await transcribe_media_async(temp_audio_path, client)
             os.remove(temp_audio_path)
 
-        if not command or command.strip() == "No speech detected in the file.":
-            # This is an error case, we'll create a response for it
+        # Step 2: Determine the complete JSON response first
+        json_response = {}
+        if not command or command.strip().lower() == "no speech detected in the file.":
             json_response = {
                 "type": "error",
                 "response": "No speech detected. Please try again."
             }
         else:
-            # --- This is the main logic block to determine the response ---
             command_lower = command.lower().strip()
             recipe_data = await recipe_assistant.get_recipe_context(recipe_id, user_data["user_id"], db)
             instructions = recipe_data.get("instructions", [])
 
+            # Handle specific navigation commands
             if any(phrase in command_lower for phrase in ["next step", "continue", "what's next"]):
-                # ... (your next step logic)
-                if current_step is not None and current_step < len(instructions) - 1:
-                    next_step = current_step + 1
+                if current_step is not None and current_step < len(instructions):
+                    next_step = current_step # current_step is 0-indexed, user sees 1-indexed
                     json_response = {
-                        "type": "navigation",
-                        "action": "next_step",
-                        "step_number": next_step + 1,
-                        "step_content": instructions[next_step],
-                        "response": f"Step {next_step + 1}: {instructions[next_step]}",
+                        "type": "navigation", "action": "next_step", "step_number": next_step + 1,
+                        "step_content": instructions[next_step], "response": f"Step {next_step + 1}: {instructions[next_step]}",
                         "has_next": next_step < len(instructions) - 1
                     }
                 else:
-                    json_response = { "type": "navigation", "action": "complete", "response": "You've completed all the steps!" }
+                    json_response = { "type": "navigation", "action": "complete", "response": "You've reached the last step!" }
             
-            # ... (Add your other elif blocks for "previous step", "timer", etc. here) ...
+            # Handle previous step commands
+            elif any(phrase in command_lower for phrase in ["previous step", "go back", "repeat"]):
+                if current_step is not None and current_step > 0:
+                    prev_step = current_step - 2
+                    json_response = {
+                        "type": "navigation", "action": "previous_step", "step_number": prev_step + 1,
+                        "step_content": instructions[prev_step], "response": f"Repeating step {prev_step + 1}: {instructions[prev_step]}",
+                        "has_previous": prev_step > 0
+                    }
+                else:
+                    json_response = { "type": "navigation", "action": "first_step", "response": "You are at the first step." }
+
+            # Handle timer commands
+            elif any(word in command_lower for word in ["timer", "time", "minutes", "seconds"]):
+                import re
+                time_match = re.search(r'(\d+)\s*(minute|min|second|sec)', command_lower)
+                if time_match:
+                    time_value = int(time_match.group(1))
+                    time_unit = time_match.group(2)
+                    json_response = {
+                        "type": "timer", "action": "set_timer", "duration": time_value,
+                        "unit": time_unit, "response": f"Okay, setting a timer for {time_value} {time_unit}s."
+                    }
+                else:
+                    json_response = { "type": "error", "response": "I see you mentioned a timer, but I couldn't understand the duration."}
             
+            # Fallback to general chat assistant
             else:
-                # Fallback to the general assistant for any other command
                 response_data = await recipe_assistant.process_message(
-                    message=command,
-                    recipe_id=recipe_id,
-                    user_id=user_data["user_id"],
-                    db=db
+                    message=command, recipe_id=recipe_id, user_id=user_data["user_id"], db=db
                 )
                 json_response = {
-                    "type": response_data["type"],
-                    "response": response_data["response"],
-                    "data": response_data.get("data")
+                    "type": response_data["type"], "response": response_data["response"], "data": response_data.get("data")
                 }
-            # --- End of main logic block ---
 
-        # Now, decide whether to send the JSON or convert its text to audio
+        # Step 3: At the very end, decide the output format
         if audio_response:
-            text_to_speak = json_response.get("response", "Sorry, I encountered an error.")
-            audio_generator = text_to_speech_async(text_to_speak, client)
+            text_to_speak = json_response.get("response", "I'm sorry, I encountered an error.")
+            audio_generator = text_to_speech_async(text_to_speak, client, voice=voice or "nova")
             return StreamingResponse(audio_generator, media_type="audio/mpeg")
         else:
-            # Default behavior: return the JSON object
             return json_response
 
     except Exception as e:
         print(f"Voice command error: {e}")
-        return {
-            "type": "error",
-            "response": "I didn't catch that. Could you try again?",
-            "error": str(e)
-        }
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+
 @app.get("/assistant/step/{recipe_id}/{step_number}")
 async def get_recipe_step(
     recipe_id: str,
