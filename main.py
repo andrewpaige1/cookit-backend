@@ -10,7 +10,7 @@ from typing import List, Optional, Dict
 from contextlib import asynccontextmanager
 from datetime import datetime
 import cv2 # OpenCV for video processing
-from fastapi import FastAPI, HTTPException, Body, Depends
+from fastapi import FastAPI, HTTPException, Body, Depends, File, UploadFile, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 import yt_dlp
 import openai
@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 
 # Import database components
 from database import get_async_session, create_tables, Recipe, User, UserRecipe, get_or_create_user, create_recipe_hybrid, get_recipe_hybrid, search_recipes_by_ingredient, search_recipes_by_cuisine, search_recipes_by_meal_type, search_recipes_by_difficulty, search_recipes_by_tag
+from helpers import is_duplicate_source
 # Import authentication
 from auth import verify_supabase_jwt, optional_auth, is_auth_configured
 # Import assistant
@@ -156,28 +157,31 @@ async def download_video_optimized(video_url: str, temp_dir: str, max_duration: 
     
     return downloaded_video_path
 
-async def transcribe_audio_async(video_path: str, client) -> str:
-    """Async audio transcription to run concurrently with frame extraction."""
-    print("Transcribing audio...")
+
+# --- Unified Media Transcription (audio or video) ---
+async def transcribe_media_async(file_path: str, client) -> str:
+    """Transcribe audio or video file using Whisper API."""
+    print(f"Transcribing media: {file_path}")
     try:
         def transcribe_task():
-            with open(video_path, "rb") as video_file:
+            with open(file_path, "rb") as media_file:
                 transcription = client.audio.transcriptions.create(
-                    model="whisper-1", 
-                    file=video_file
+                    model="whisper-1",
+                    file=media_file
                 )
             return transcription.text
 
         loop = asyncio.get_event_loop()
         with concurrent.futures.ThreadPoolExecutor() as executor:
             transcript_text = await loop.run_in_executor(executor, transcribe_task)
-        
         print(f"Transcript received: {transcript_text[:150]}...")
         return transcript_text
     except Exception as e:
-        print(f"Could not transcribe audio: {e}")
-        return "No speech detected in the video."
+        print(f"Could not transcribe media: {e}")
+        return "No speech detected in the file."
 # --- API Endpoint for Parsing Video Recipes ---
+
+# --- Unified Recipe Parsing Endpoint (video URL or audio file) ---
 @app.post("/parse-recipe")
 async def parse_recipe(
     url: str = Body(..., embed=True),
@@ -209,6 +213,12 @@ async def parse_recipe(
             print(f"❌ RECIPE PARSE: User creation failed: {e}")
             raise HTTPException(status_code=500, detail=f"User creation failed: {e}")
 
+        # --- Step 0.5: Check for duplicate source ---
+        duplicate = await is_duplicate_source(str(user.id), video_url, db)
+        print("DUPLICATE CHECK")
+        if duplicate:
+            print(f"❌ RECIPE PARSE: Duplicate source detected for user {user.id} and url {video_url}")
+            raise HTTPException(status_code=409, detail="Duplicate source: this video has already been uploaded by this user.")
         # --- Step 1: Download optimized video ---
         print("⬇️ RECIPE PARSE: Starting video download...")
         try:
@@ -232,7 +242,7 @@ async def parse_recipe(
                 asyncio.to_thread(extract_frames_from_video, downloaded_video_path, max_frames=10)
             )
             audio_task = asyncio.create_task(
-                transcribe_audio_async(downloaded_video_path, client)
+                transcribe_media_async(downloaded_video_path, client)
             )
             
             # Wait for both tasks to complete
@@ -400,7 +410,6 @@ async def parse_recipe(
         print(f"An error occurred: {e}")
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
     finally:
-        print("Cleaning up temporary files.")
         shutil.rmtree(temp_dir)
 
 @app.get("/recipes")
@@ -736,26 +745,55 @@ async def root():
 
 @app.post("/assistant/chat")
 async def chat_with_assistant(
-    recipe_id: str = Body(..., embed=True),
-    message: str = Body(..., embed=True),
-    conversation_history: Optional[List[Dict[str, str]]] = Body(None, embed=True),
+    recipe_id: str = Form(None),
+    message: str = Form(None),
+    conversation_history: Optional[str] = Form(None),
+    audio: UploadFile = File(None),
     user_data: dict = Depends(verify_supabase_jwt),
     db: AsyncSession = Depends(get_async_session)
 ):
     """
     Chat with AI assistant about a specific recipe.
-    Provides contextual responses based on recipe ingredients, instructions, and details.
+    Accepts either a text message or an audio file (multipart/form-data).
+    If audio is provided, transcribes with Whisper and uses the result as the message.
     """
     try:
+        # If audio is provided, transcribe it
+        if audio is not None:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".m4a") as temp_audio:
+                temp_audio.write(await audio.read())
+                temp_audio.flush()
+                temp_audio_path = temp_audio.name
+            message = await transcribe_media_async(temp_audio_path, client)
+            os.remove(temp_audio_path)
+            if not message or message.strip() == "No speech detected in the file.":
+                return {
+                    "success": False,
+                    "message": "No speech detected in the audio file. Please try again.",
+                    "type": "error"
+                }
+        if not message:
+            return {
+                "success": False,
+                "message": "No message provided. Please provide a text or audio message.",
+                "type": "error"
+            }
+        # Parse conversation_history if present
+        history = []
+        if conversation_history:
+            try:
+                import json
+                history = json.loads(conversation_history)
+            except Exception:
+                history = []
         # Process message with recipe context
         response_data = await recipe_assistant.process_message(
             message=message,
             recipe_id=recipe_id,
             user_id=user_data["user_id"],
             db=db,
-            conversation_history=conversation_history or []
+            conversation_history=history
         )
-        
         return {
             "success": True,
             "message": response_data["response"],
@@ -765,7 +803,6 @@ async def chat_with_assistant(
             "recipe_context": response_data.get("recipe_context"),
             "timestamp": datetime.utcnow().isoformat()
         }
-        
     except HTTPException as e:
         raise e
     except Exception as e:
@@ -864,23 +901,41 @@ async def get_quick_commands(
 
 @app.post("/assistant/voice")
 async def process_voice_command(
-    recipe_id: str = Body(..., embed=True),
-    command: str = Body(..., embed=True),
-    current_step: Optional[int] = Body(None, embed=True),
+    recipe_id: str = Form(None),
+    command: str = Form(None),
+    current_step: Optional[int] = Form(None),
+    audio: UploadFile = File(None),
     user_data: dict = Depends(verify_supabase_jwt),
     db: AsyncSession = Depends(get_async_session)
 ):
     """
     Process voice commands for hands-free cooking.
-    Optimized for voice interaction with short, actionable responses.
+    Accepts either a text command or an audio file (multipart/form-data).
+    If audio is provided, transcribes with Whisper and uses the result as the command.
     """
     try:
+        # If audio is provided, transcribe it
+        if audio is not None:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".m4a") as temp_audio:
+                temp_audio.write(await audio.read())
+                temp_audio.flush()
+                temp_audio_path = temp_audio.name
+            command = await transcribe_media_async(temp_audio_path, client)
+            os.remove(temp_audio_path)
+            if not command or command.strip() == "No speech detected in the file.":
+                return {
+                    "type": "error",
+                    "response": "No speech detected in the audio file. Please try again."
+                }
+        if not command:
+            return {
+                "type": "error",
+                "response": "No command provided. Please provide a text or audio command."
+            }
+        command_lower = command.lower().strip()
         # Get recipe context
         recipe_data = await recipe_assistant.get_recipe_context(recipe_id, user_data["user_id"], db)
         instructions = recipe_data.get("instructions", [])
-        
-        command_lower = command.lower().strip()
-        
         # Handle navigation commands
         if any(phrase in command_lower for phrase in ["next step", "continue", "what's next"]):
             if current_step is not None and current_step < len(instructions) - 1:
@@ -899,7 +954,6 @@ async def process_voice_command(
                     "action": "complete",
                     "response": "You've completed all the steps! Your dish should be ready to serve."
                 }
-        
         elif any(phrase in command_lower for phrase in ["previous step", "go back", "repeat"]):
             if current_step is not None and current_step > 0:
                 prev_step = current_step - 1
@@ -917,7 +971,6 @@ async def process_voice_command(
                     "action": "first_step",
                     "response": "You're already at the first step."
                 }
-        
         elif any(phrase in command_lower for phrase in ["start over", "begin", "first step"]):
             if instructions:
                 return {
@@ -928,10 +981,8 @@ async def process_voice_command(
                     "response": f"Let's start cooking! Step 1: {instructions[0]}",
                     "total_steps": len(instructions)
                 }
-        
         # Handle timer commands
         elif any(word in command_lower for word in ["timer", "time", "minutes", "seconds"]):
-            # Extract time from command
             import re
             time_match = re.search(r'(\d+)\s*(minute|min|second|sec)', command_lower)
             if time_match:
@@ -944,7 +995,6 @@ async def process_voice_command(
                     "unit": time_unit,
                     "response": f"Timer set for {time_value} {time_unit}{'s' if time_value != 1 else ''}."
                 }
-        
         # For other commands, use the general assistant
         response_data = await recipe_assistant.process_message(
             message=command,
@@ -952,13 +1002,10 @@ async def process_voice_command(
             user_id=user_data["user_id"],
             db=db
         )
-        
         # Optimize response for voice - keep it concise
         response_text = response_data["response"]
         if len(response_text) > 200:
-            # Truncate for voice but keep important info
             response_text = response_text[:200] + "... Ask me for more details if needed."
-        
         return {
             "type": response_data["type"],
             "response": response_text,
@@ -966,7 +1013,6 @@ async def process_voice_command(
             "data": response_data.get("data"),
             "optimized_for_voice": True
         }
-        
     except Exception as e:
         print(f"Voice command error: {e}")
         return {
@@ -1161,3 +1207,39 @@ async def generate_shopping_list(
     except Exception as e:
         print(f"Shopping list error: {e}")
         raise HTTPException(status_code=500, detail="Could not generate shopping list")
+
+@app.delete("/recipes/{recipe_id}")
+async def delete_recipe(
+    recipe_id: str,
+    user_data: dict = Depends(verify_supabase_jwt),
+    db: AsyncSession = Depends(get_async_session)
+):
+    """Delete a recipe by ID if it belongs to the authenticated user."""
+    from sqlalchemy import delete, select
+    import uuid
+
+    user_uuid = uuid.UUID(user_data["user_id"])
+    recipe_uuid = uuid.UUID(recipe_id)
+
+    # Check if the recipe exists and belongs to the user
+    result = await db.execute(
+        select(Recipe).where(
+            Recipe.id == recipe_uuid,
+            Recipe.user_id == user_uuid
+        )
+    )
+    recipe = result.scalar_one_or_none()
+
+    if not recipe:
+        raise HTTPException(status_code=404, detail="Recipe not found or does not belong to the user.")
+
+    # Delete the recipe
+    await db.execute(
+        delete(Recipe).where(
+            Recipe.id == recipe_uuid,
+            Recipe.user_id == user_uuid
+        )
+    )
+    await db.commit()
+
+    return {"message": "Recipe deleted successfully."}

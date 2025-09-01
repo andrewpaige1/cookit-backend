@@ -46,24 +46,25 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+from sqlalchemy import UniqueConstraint
+
 class Recipe(Base):
     __tablename__ = "recipes"
-    
+    __table_args__ = (
+        UniqueConstraint('user_id', 'source_url', name='uix_user_source'),
+    )
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), nullable=True, index=True)  # Link to user
     title = Column(Text, nullable=False, index=True)  # Searchable title
     source_url = Column(Text)  # Original URL
-    
     # Fast searchable columns
     cuisine_type = Column(String(50), nullable=True, index=True)  # 'Italian', 'Asian', etc.
     meal_type = Column(String(50), nullable=True, index=True)     # 'Breakfast', 'Dinner', etc.
     difficulty = Column(String(20), nullable=True, index=True)    # 'Easy', 'Medium', 'Hard'
-    
     # JSONB hybrid approach
     recipe_data = Column(JSON, nullable=False)  # Full LLM output (ingredients, instructions, metadata)
     searchable_ingredients = Column(JSON)  # Array of ingredient names for fast search
     searchable_tags = Column(JSON)  # Array of tags for fast search
-    
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 class UserRecipe(Base):
