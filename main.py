@@ -788,6 +788,11 @@ async def chat_with_assistant(
                 audio_generator = text_to_speech_async(preview_text, client, voice=voice_name)
                 return StreamingResponse(audio_generator, media_type="audio/mpeg")
             return {"success": True, "message": preview_text, "type": "preview"}
+        
+        # Validate recipe_id is provided for non-preview requests
+        if not recipe_id:
+            raise HTTPException(status_code=400, detail="recipe_id is required when preview=false")
+        
         # Step 1: Transcribe audio to text if provided
         if audio is not None:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".m4a") as temp_audio:
@@ -935,6 +940,11 @@ async def process_voice_command(
                 audio_generator = text_to_speech_async(preview_text, client, voice=voice_name)
                 return StreamingResponse(audio_generator, media_type="audio/mpeg")
             return {"type": "preview", "response": preview_text}
+        
+        # Validate recipe_id is provided for non-preview requests
+        if not recipe_id:
+            raise HTTPException(status_code=400, detail="recipe_id is required when preview=false")
+        
         # Step 1: Transcribe audio to text if provided
         if audio is not None:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".m4a") as temp_audio:
